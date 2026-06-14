@@ -92,8 +92,221 @@ class LogitsProcessor(PluggableLayer):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        # Get the logits for the next tokens.
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        if not hasattr(self, "_int8v2_initialized"):
+            self._int8v2_initialized = True
+            weight = lm_head.weight.data
+            if (
+                weight.dtype in (torch.bfloat16, torch.float16)
+                and weight.shape[0] > 100000
+            ):
+                scales = weight.float().abs().amax(dim=1) / 127.0
+                scales = scales.clamp(min=1e-12)
+                weight_int8 = (
+                    (weight.float() / scales.unsqueeze(1))
+                    .round()
+                    .clamp(-127, 127)
+                    .to(torch.int8)
+                )
+                lm_head._ww_int8 = weight_int8
+                lm_head._ww_scales = scales.to(torch.float16)
+                original_size = weight.numel() * weight.element_size()
+                lm_head.weight.data = torch.empty(
+                    0, device=weight.device, dtype=weight.dtype
+                )
+
+                import sys as _sys
+
+                print(
+                    "DGX_SPARK_V2: LM Head -> INT8 Batched Triton "
+                    f"({list(weight_int8.shape)}, "
+                    f"saved {original_size // 1024 // 1024}MB)",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+
+                import triton
+                import triton.language as tl
+
+                autotune_configs = [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_K": 256},
+                        num_warps=4,
+                        num_stages=3,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 128, "BLOCK_K": 128},
+                        num_warps=4,
+                        num_stages=3,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 128, "BLOCK_K": 256},
+                        num_warps=4,
+                        num_stages=2,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 128, "BLOCK_K": 256},
+                        num_warps=4,
+                        num_stages=3,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 128, "BLOCK_K": 256},
+                        num_warps=8,
+                        num_stages=2,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 128, "BLOCK_K": 512},
+                        num_warps=8,
+                        num_stages=2,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 256, "BLOCK_K": 128},
+                        num_warps=8,
+                        num_stages=3,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 256, "BLOCK_K": 256},
+                        num_warps=8,
+                        num_stages=2,
+                    ),
+                ]
+
+                @triton.autotune(
+                    configs=autotune_configs,
+                    key=["M", "K", "NUM_BATCH"],
+                )
+                @triton.jit
+                def _int8_lm_head_kernel(
+                    out_ptr,
+                    w_ptr,
+                    x_ptr,
+                    s_ptr,
+                    M,
+                    K,
+                    stride_ob,
+                    stride_xb,
+                    NUM_BATCH: tl.constexpr,
+                    BLOCK_M: tl.constexpr,
+                    BLOCK_K: tl.constexpr,
+                ):
+                    pid_m = tl.program_id(0)
+                    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                    row_mask = rows < M
+                    acc0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                    acc1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                    acc2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                    acc3 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                    for ks in range(0, K, BLOCK_K):
+                        cols = ks + tl.arange(0, BLOCK_K)
+                        col_mask = cols < K
+                        w = tl.load(
+                            w_ptr + rows[:, None] * K + cols[None, :],
+                            mask=row_mask[:, None] & col_mask[None, :],
+                            other=0,
+                        ).to(tl.float32)
+                        x0 = tl.load(
+                            x_ptr + cols,
+                            mask=col_mask,
+                            other=0.0,
+                        ).to(tl.float32)
+                        acc0 += tl.sum(w * x0[None, :], axis=1)
+                        if NUM_BATCH > 1:
+                            x1 = tl.load(
+                                x_ptr + stride_xb + cols,
+                                mask=col_mask,
+                                other=0.0,
+                            ).to(tl.float32)
+                            acc1 += tl.sum(w * x1[None, :], axis=1)
+                        if NUM_BATCH > 2:
+                            x2 = tl.load(
+                                x_ptr + 2 * stride_xb + cols,
+                                mask=col_mask,
+                                other=0.0,
+                            ).to(tl.float32)
+                            acc2 += tl.sum(w * x2[None, :], axis=1)
+                        if NUM_BATCH > 3:
+                            x3 = tl.load(
+                                x_ptr + 3 * stride_xb + cols,
+                                mask=col_mask,
+                                other=0.0,
+                            ).to(tl.float32)
+                            acc3 += tl.sum(w * x3[None, :], axis=1)
+                    scale = tl.load(s_ptr + rows, mask=row_mask, other=1.0).to(
+                        tl.float32
+                    )
+                    tl.store(
+                        out_ptr + rows,
+                        (acc0 * scale).to(tl.float16),
+                        mask=row_mask,
+                    )
+                    if NUM_BATCH > 1:
+                        tl.store(
+                            out_ptr + stride_ob + rows,
+                            (acc1 * scale).to(tl.float16),
+                            mask=row_mask,
+                        )
+                    if NUM_BATCH > 2:
+                        tl.store(
+                            out_ptr + 2 * stride_ob + rows,
+                            (acc2 * scale).to(tl.float16),
+                            mask=row_mask,
+                        )
+                    if NUM_BATCH > 3:
+                        tl.store(
+                            out_ptr + 3 * stride_ob + rows,
+                            (acc3 * scale).to(tl.float16),
+                            mask=row_mask,
+                        )
+
+                lm_head._ww_kernel_v2 = _int8_lm_head_kernel
+
+        if hasattr(lm_head, "_ww_int8"):
+            vocab_size, hidden_size = lm_head._ww_int8.shape
+            inputs = hidden_states.view(-1, hidden_size)
+            batch_size = inputs.shape[0]
+            output = torch.empty(
+                batch_size,
+                vocab_size,
+                dtype=torch.float16,
+                device=inputs.device,
+            )
+            grid = lambda meta: (  # noqa: E731
+                (vocab_size + meta["BLOCK_M"] - 1) // meta["BLOCK_M"],
+            )
+            if batch_size <= 4:
+                lm_head._ww_kernel_v2[grid](
+                    output,
+                    lm_head._ww_int8,
+                    inputs.to(torch.float16),
+                    lm_head._ww_scales,
+                    vocab_size,
+                    hidden_size,
+                    output.stride(0),
+                    inputs.stride(0),
+                    NUM_BATCH=batch_size,
+                )
+            else:
+                for idx in range(batch_size):
+                    lm_head._ww_kernel_v2[grid](
+                        output[idx : idx + 1],
+                        lm_head._ww_int8,
+                        inputs[idx : idx + 1].to(torch.float16),
+                        lm_head._ww_scales,
+                        vocab_size,
+                        hidden_size,
+                        vocab_size,
+                        hidden_size,
+                        NUM_BATCH=1,
+                    )
+            logits = output.view(hidden_states.shape[:-1] + (vocab_size,))
+            if embedding_bias is not None:
+                logits = logits + embedding_bias
+        else:
+            # Get the logits for the next tokens.
+            logits = lm_head.quant_method.apply(
+                lm_head,
+                hidden_states,
+                bias=embedding_bias,
+            )
 
         # Gather logits for TP
         logits = self._gather_logits(logits)
