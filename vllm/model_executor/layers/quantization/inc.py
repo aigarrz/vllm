@@ -244,7 +244,12 @@ class INCConfig(QuantizationConfig):
                 hf_to_vllm_mapper.apply_list(list(self.fp8_layers))
             )
 
-    def maybe_update_config(self, model_name: str, revision: str | None = None):
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config: Any | None = None,
+        revision: str | None = None,
+    ):
         """Detect FP8 layers in hybrid INT4+FP8 checkpoints."""
         metadata = get_safetensors_params_metadata(model_name, revision=revision)
         fp8_weights: dict[str, dict[str, Any]] = {}
