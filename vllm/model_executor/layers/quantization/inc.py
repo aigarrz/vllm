@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
+from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
@@ -28,6 +30,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.transformers_utils.config import get_safetensors_params_metadata
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -98,6 +101,8 @@ class INCConfig(QuantizationConfig):
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
+        self.fp8_config: Fp8Config | None = None
+        self.fp8_layers: set[str] = set()
 
     def __repr__(self) -> str:
         return (
@@ -234,6 +239,54 @@ class INCConfig(QuantizationConfig):
             )
         if self.extra_config is not None:
             self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
+        if self.fp8_layers:
+            self.fp8_layers = set(
+                hf_to_vllm_mapper.apply_list(list(self.fp8_layers))
+            )
+
+    def maybe_update_config(self, model_name: str, revision: str | None = None):
+        """Detect FP8 layers in hybrid INT4+FP8 checkpoints."""
+        metadata = get_safetensors_params_metadata(model_name, revision=revision)
+        fp8_weights: dict[str, dict[str, Any]] = {}
+        for param_name, info in metadata.items():
+            dtype_str = info.get("dtype")
+            if dtype_str is None:
+                continue
+            torch_dtype = _SAFETENSORS_TO_TORCH_DTYPE.get(dtype_str)
+            if torch_dtype == torch.float8_e4m3fn and param_name.endswith(".weight"):
+                scale_name = param_name.replace(".weight", ".weight_scale_inv")
+                if scale_name in metadata:
+                    fp8_weights[param_name] = info
+
+        if not fp8_weights:
+            return
+
+        block_size = None
+        for param_name, info in fp8_weights.items():
+            scale_info = metadata[param_name.replace(".weight", ".weight_scale_inv")]
+            weight_shape = info.get("shape", [])
+            scale_shape = scale_info.get("shape", [])
+            if len(weight_shape) == 2 and len(scale_shape) == 2:
+                block_size = [
+                    weight_shape[0] // scale_shape[0],
+                    weight_shape[1] // scale_shape[1],
+                ]
+                break
+
+        if block_size is None:
+            return
+
+        self.fp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=block_size,
+        )
+        self.fp8_layers = {name.rsplit(".weight", 1)[0] for name in fp8_weights}
+        logger.info(
+            "Hybrid INT4+FP8: detected %d FP8 dense layers (block_size=%s)",
+            len(self.fp8_layers),
+            block_size,
+        )
 
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -320,6 +373,27 @@ class INCConfig(QuantizationConfig):
                 return AWQLinearMethod(quant_args)
         return None
 
+    def _is_layer_fp8(self, prefix: str) -> bool:
+        """Check whether a layer should use FP8 in a hybrid checkpoint."""
+        if not self.fp8_layers:
+            return False
+        if prefix in self.fp8_layers:
+            return True
+
+        fused_mapping = getattr(self, "packed_modules_mapping", {})
+        proj_name = prefix.split(".")[-1]
+        if proj_name in fused_mapping:
+            shard_prefixes = [
+                prefix.replace(proj_name, shard)
+                for shard in fused_mapping[proj_name]
+            ]
+            return all(
+                any(fp8_layer in shard_prefix for fp8_layer in self.fp8_layers)
+                for shard_prefix in shard_prefixes
+            )
+
+        return any(fp8_layer in prefix for fp8_layer in self.fp8_layers)
+
     def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
             check_marlin_supported,
@@ -328,6 +402,19 @@ class INCConfig(QuantizationConfig):
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
+            fp8_match = self._is_layer_fp8(prefix) if self.fp8_config else False
+            if "shared_expert" in prefix or "linear_attn" in prefix:
+                logger.info(
+                    "INC GPTQ dispatch: prefix=%s, bits=%d, fp8_match=%s, "
+                    "fp8_config=%s, layer_type=%s",
+                    prefix,
+                    weight_bits,
+                    fp8_match,
+                    self.fp8_config is not None,
+                    type(layer).__name__,
+                )
+            if self.fp8_config and fp8_match:
+                return Fp8LinearMethod(self.fp8_config)
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             else:
@@ -487,6 +574,8 @@ class INCConfig(QuantizationConfig):
                 if (
                     layer_name == prefix or layer_name == f"model.{prefix}"
                 ) and self.extra_config[layer_name].get("bits", 16) >= 16:
+                    if self.fp8_config and self._is_layer_fp8(prefix):
+                        return Fp8LinearMethod(self.fp8_config)
                     return UnquantizedLinearMethod()
 
         if current_platform.is_xpu():
