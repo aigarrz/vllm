@@ -758,8 +758,12 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_scales,
             weight_bits=self.quant_config.weight_bits,
             group_size=self.quant_config.group_size,
-            w1_zp=getattr(layer, "w13_qzeros", None),
-            w2_zp=getattr(layer, "w2_qzeros", None),
+            w1_zp=getattr(layer, "w13_qzeros", None)
+            if not self.quant_config.is_sym
+            else None,
+            w2_zp=getattr(layer, "w2_qzeros", None)
+            if not self.quant_config.is_sym
+            else None,
             w1_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
         )
