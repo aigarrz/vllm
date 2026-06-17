@@ -243,10 +243,17 @@ class Qwen3CoderToolParser(ToolParser):
 
         # If no delta text, return None unless it's an EOS token after tools
         if not delta_text:
+            # With speculative decoding (MTP), EOS may arrive while we are
+            # still inside a function block whose parameters haven't been
+            # processed yet (the json_started early-return on the previous
+            # call prevented it). Fall through to process current_text so
+            # parameters and the closing "}" are still emitted correctly.
+            if self.in_function and not self.json_closed:
+                pass  # fall through to parameter processing below
             # Check if this is an EOS token after all tool calls are complete
             # Check for tool calls in text even if is_tool_call_started
             # is False (might have been reset after processing all tools)
-            if delta_token_ids and self.tool_call_end_token_id not in delta_token_ids:
+            elif delta_token_ids and self.tool_call_end_token_id not in delta_token_ids:
                 # Count complete tool calls
                 complete_calls = len(
                     self.tool_call_complete_regex.findall(current_text)
@@ -265,7 +272,8 @@ class Qwen3CoderToolParser(ToolParser):
                 elif not self.is_tool_call_started and current_text:
                     # This is a regular content response that's now complete
                     return DeltaMessage(content="")
-            return None
+            else:
+                return None
 
         # Update accumulated text
         self.accumulated_text = current_text
